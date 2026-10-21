@@ -7,8 +7,7 @@
  * WebhookDelivery model owns storage.
  *
  * Replay contract (POST /api/v1/developer/webhooks/:id/deliveries/:deliveryId/replay):
- * - Only deliveries in the `failed` state may be replayed. A `replaying` claim
- *   left behind by a crashed process becomes replayable once it is stale.
+ * - Only deliveries in the `failed` state may be replayed.
  * - The exact payload bytes and HMAC signature stored at dispatch time are
  *   re-sent verbatim; the signature is never recomputed, so receivers that
  *   captured the original signature keep validating it.
@@ -40,11 +39,6 @@ export const WEBHOOK_DELIVERY_HEADER = "x-stellarproof-delivery-id";
 
 /** Per-attempt timeout for a single webhook POST. */
 const DISPATCH_TIMEOUT_MS = 10_000;
-/**
- * How long a `replaying` claim may sit untouched before another replay may
- * reclaim it (covers a process crash between claim and final update).
- */
-const REPLAY_STALE_MS = 60_000;
 
 /** Outcome of a single HTTP dispatch attempt against the endpoint. */
 export interface WebhookDispatchOutcome {
@@ -54,10 +48,7 @@ export interface WebhookDispatchOutcome {
 }
 
 export class WebhookDeliveryService {
-  constructor(
-    private readonly timeoutMs: number = DISPATCH_TIMEOUT_MS,
-    private readonly staleReplayMs: number = REPLAY_STALE_MS
-  ) {}
+  constructor(private readonly timeoutMs: number = DISPATCH_TIMEOUT_MS) {}
 
   // -------------------------------------------------------------------------
   // Producer API – persist a delivery and run its initial dispatch
@@ -149,12 +140,7 @@ export class WebhookDeliveryService {
 
     this.assertCanReplay(delivery, requester);
 
-    const isReplayable =
-      delivery.status === WebhookDeliveryStatus.FAILED ||
-      (delivery.status === WebhookDeliveryStatus.REPLAYING &&
-        this.isReplayClaimStale(delivery));
-
-    if (!isReplayable) {
+    if (delivery.status !== WebhookDeliveryStatus.FAILED) {
       throw new AppError(
         `Only failed deliveries can be replayed; delivery '${deliveryId}' has status '${delivery.status}'`,
         StatusCodes.CONFLICT,
@@ -163,18 +149,11 @@ export class WebhookDeliveryService {
     }
 
     // -- Atomic claim: failed -> replaying (compare-and-swap) ---------------
-    const staleCutoff = new Date(Date.now() - this.staleReplayMs);
     const claimed = await WebhookDeliveryModel.findOneAndUpdate(
       {
         _id: deliveryId,
         webhookId,
-        $or: [
-          { status: WebhookDeliveryStatus.FAILED },
-          {
-            status: WebhookDeliveryStatus.REPLAYING,
-            updatedAt: { $lt: staleCutoff },
-          },
-        ],
+        status: WebhookDeliveryStatus.FAILED,
       },
       {
         $set: { status: WebhookDeliveryStatus.REPLAYING },
@@ -293,14 +272,6 @@ export class WebhookDeliveryService {
         "DELIVERY_FORBIDDEN"
       );
     }
-  }
-
-  private isReplayClaimStale(delivery: IWebhookDelivery): boolean {
-    const updatedAt = delivery.updatedAt;
-    if (!updatedAt) return false;
-    return (
-      new Date(updatedAt).getTime() < Date.now() - this.staleReplayMs
-    );
   }
 
   /** Single HTTP POST of the (stored) payload with the (stored) signature. */

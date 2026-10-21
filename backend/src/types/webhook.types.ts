@@ -22,8 +22,7 @@ import type { Types } from "mongoose";
  *   failed    -> replaying            (replay claimed)
  *   replaying -> delivered | failed   (replay dispatched)
  *
- * Only deliveries in the `failed` state may be replayed (a `replaying` state
- * left behind by a crashed process is reclaimable once it goes stale).
+ * Only deliveries in the `failed` state may be replayed.
  */
 export enum WebhookDeliveryStatus {
   PENDING = "pending",

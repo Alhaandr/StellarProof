@@ -142,10 +142,7 @@ describe('WebhookDeliveryService.replayFailedDelivery', () => {
     const [claimFilter, claimUpdate] = MockedModel.findOneAndUpdate.mock.calls[0];
     expect(claimFilter._id).toBe(deliveryId);
     expect(claimFilter.webhookId).toBe('wh-1');
-    expect(claimFilter.$or).toEqual([
-      { status: WebhookDeliveryStatus.FAILED },
-      { status: WebhookDeliveryStatus.REPLAYING, updatedAt: { $lt: expect.any(Date) } },
-    ]);
+    expect(claimFilter.status).toBe(WebhookDeliveryStatus.FAILED);
     expect(claimUpdate).toEqual({
       $set: { status: WebhookDeliveryStatus.REPLAYING },
       $inc: { attempts: 1 },
@@ -237,23 +234,22 @@ describe('WebhookDeliveryService.replayFailedDelivery', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('reclaims a replaying delivery whose claim went stale (crashed process)', async () => {
+  it('rejects a replaying delivery even when its claim is stale', async () => {
     const delivery = buildDelivery({
       status: WebhookDeliveryStatus.REPLAYING,
       updatedAt: new Date(Date.now() - 5 * 60_000), // older than the stale window
     });
 
     MockedModel.findOne.mockReturnValue(query(delivery));
-    MockedModel.findOneAndUpdate
-      .mockReturnValueOnce(query({ ...delivery, status: WebhookDeliveryStatus.REPLAYING }))
-      .mockReturnValueOnce(query({ ...delivery, status: WebhookDeliveryStatus.DELIVERED }));
+    await expect(
+      service.replayFailedDelivery(
+        { webhookId: 'wh-1', deliveryId: String(delivery._id) },
+        { id: String(delivery.owner), role: 'developer' }
+      )
+    ).rejects.toMatchObject({ code: 'DELIVERY_NOT_REPLAYABLE', statusCode: 409 });
 
-    const result = await service.replayFailedDelivery(
-      { webhookId: 'wh-1', deliveryId: String(delivery._id) },
-      { id: String(delivery.owner), role: 'developer' }
-    );
-
-    expect(result.delivered).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(MockedModel.findOneAndUpdate).not.toHaveBeenCalled();
   });
 
   it('returns 404 when the delivery does not belong to the webhook', async () => {
