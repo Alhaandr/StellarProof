@@ -1,5 +1,6 @@
 "use client";
 
+
 import React, { useState, useEffect, useMemo } from "react";
 import Link from "next/link";
 import {
@@ -24,6 +25,7 @@ function truncateHash(hash: string): string {
   if (!hash || hash.length < 16) return hash || "";
   return `${hash.slice(0, 10)}...${hash.slice(-6)}`;
 }
+
 
 function StatusBadge({ status }: { status: string }) {
   let badgeStyle = "bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-300";
