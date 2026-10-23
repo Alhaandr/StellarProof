@@ -5,21 +5,32 @@ import { webhookDeliveryService } from '../services/webhookDelivery.service';
 import { AppError } from '../errors/AppError';
 import type { IWebhookDelivery } from '../types/webhook.types';
 
-export const generateApiKey = async (req: Request, res: Response): Promise<void> => {
+/**
+ * Legacy API key generation endpoint
+ */
+export const generateApiKey = async (
+  req: Request,
+  res: Response
+): Promise<void> => {
   try {
     const userId = req.body.userId || (req as any).user?.id;
-    
+
     if (!userId) {
-      res.status(401).json({ success: false, message: 'Unauthorized. User ID required.' });
+      res
+        .status(401)
+        .json({
+          success: false,
+          message: 'Unauthorized. User ID required.',
+        });
       return;
     }
 
     const plainTextApiKey = await generateApiKeyForUser(userId);
-    
+
     res.status(201).json({
       success: true,
       message: 'API key generated successfully.',
-      key: plainTextApiKey
+      key: plainTextApiKey,
     });
   } catch (error: any) {
     console.error('[API Key Error]', error);

@@ -16,6 +16,16 @@ const IV_LENGTH = 12; // 96-bit nonce is standard for GCM buffers
 const AUTH_TAG_LENGTH = 16; // 128-bit auth tag
 const DATA_KEY_LENGTH = 32; // AES-256 data key
 
+function unexpiredFilter(now: Date): Record<string, unknown> {
+  return {
+    $or: [
+      { expiresAt: { $exists: false } },
+      { expiresAt: null },
+      { expiresAt: { $gt: now } },
+    ],
+  };
+}
+
 export interface RotateKeyResult {
   oldKeyVersion: string;
   newKeyVersion: string;
@@ -336,6 +346,19 @@ export class KmsService {
     }
 
     await this.destroyBlobs(blobs.replaced);
+    void webhookService.enqueueForOwner(
+      userId,
+      createWebhookEvent(VerificationWebhookEvent.KMS_KEY_ROTATED, {
+        keyVersion: result.newKeyVersion,
+        previousKeyVersion: result.oldKeyVersion,
+        assetsReEncrypted: result.assetsReEncrypted,
+      })
+    ).catch((error: unknown) => {
+      logger.error('Failed to enqueue KMS rotation webhook', {
+        userId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
     return result;
   }
 
@@ -503,7 +526,7 @@ export class KmsService {
 
   /** Reads KMS_MASTER_KEY (64 hex characters) used to wrap per-asset data keys. */
   private resolveWrappingKey(): Buffer {
-    const hex = process.env.KMS_MASTER_KEY;
+    const hex = process.env.KMS_MASTER_KEY ?? process.env.MASTER_KEY;
     if (!hex || !/^[0-9a-fA-F]{64}$/.test(hex)) {
       throw new Error('KMS_MASTER_KEY must be a 64-character hex string (32 bytes for AES-256)');
     }
