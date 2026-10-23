@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { StatusCodes } from 'http-status-codes';
 import { generateApiKeyForUser } from '../services/developer.service';
 import { webhookDeliveryService } from '../services/webhookDelivery.service';
+import { webhookSecretService } from '../services/webhookSecret.service';
 import { AppError } from '../errors/AppError';
 import type { IWebhookDelivery } from '../types/webhook.types';
 
@@ -112,4 +113,26 @@ export const replayWebhookDelivery = async (
   } catch (error) {
     next(error);
   }
+};
+
+/** Rotates a webhook HMAC secret and returns its plaintext exactly once. */
+export const rotateWebhookSecret = async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+  try {
+    const user = req.user;
+    if (!user) throw new AppError('Unauthorized. Authenticated developer required.', StatusCodes.UNAUTHORIZED, 'AUTH_REQUIRED');
+    const result = await webhookSecretService.rotateSecret(
+      { webhookId: req.params.id, gracePeriodSeconds: req.body.gracePeriodSeconds },
+      { id: String(user._id), role: user.role }
+    );
+    res.status(StatusCodes.OK).json({
+      success: true,
+      message: 'Webhook secret rotated. Store this secret now; it will not be returned again.',
+      data: {
+        webhookId: result.webhookId,
+        secret: result.secret,
+        version: result.version,
+        previousSecretValidUntil: result.previousSecretValidUntil.toISOString(),
+      },
+    });
+  } catch (error) { next(error); }
 };

@@ -18,7 +18,7 @@ import { Router } from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { StatusCodes } from 'http-status-codes';
-import { generateApiKey, replayWebhookDelivery } from '../controllers/developer.controller';
+import { generateApiKey, replayWebhookDelivery, rotateWebhookSecret } from '../controllers/developer.controller';
 import { verifyApiKey } from '../middlewares/apiKey.middleware';
 
 const router = Router();
@@ -208,6 +208,10 @@ export const replayDeliveryParamsSchema = z.object({
     .regex(/^[a-f\d]{24}$/i, 'deliveryId must be a valid MongoDB ObjectId'),
 });
 
+export const rotateWebhookSecretBodySchema = z.object({
+  gracePeriodSeconds: z.number().int().min(0).max(604800).optional(),
+});
+
 // ---------------------------------------------------------------------------
 // Path parameter validation middleware
 // ---------------------------------------------------------------------------
@@ -247,6 +251,23 @@ router.post(
   verifyApiKey,
   validateReplayDeliveryParams,
   replayWebhookDelivery
+);
+
+router.post(
+  '/webhooks/:id/rotate-secret',
+  verifyApiKey,
+  (req: Request, res: Response, next: NextFunction): void => {
+    const params = replayDeliveryParamsSchema.shape.id.safeParse(req.params.id);
+    const body = rotateWebhookSecretBodySchema.safeParse(req.body ?? {});
+    if (!params.success || !body.success) {
+      res.status(StatusCodes.BAD_REQUEST).json({ success: false, error: 'Invalid rotate-secret request' });
+      return;
+    }
+    req.params.id = params.data;
+    req.body = body.data;
+    next();
+  },
+  rotateWebhookSecret
 );
 
 export default router;
