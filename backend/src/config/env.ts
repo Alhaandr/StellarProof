@@ -262,4 +262,12 @@ export const env = {
 
   /** Cron expression (UTC) for the scheduled KMS expiry and rotation sweep */
   KMS_ROTATION_CRON_SCHEDULE: optionalEnv("KMS_ROTATION_CRON_SCHEDULE", "0 * * * *"),
-} as const;
+
+  /** API key usage data retention period in days (default: 90 days) */
+  API_USAGE_RETENTION_DAYS: optionalPositiveIntEnv("API_USAGE_RETENTION_DAYS", 90),
+
+  /** Maximum date range for a single usage query in days (default: 90 days) */
+  API_USAGE_MAX_QUERY_WINDOW_DAYS: optionalPositiveIntEnv("API_USAGE_MAX_QUERY_WINDOW_DAYS", 90),
+
+  /** Default query range when no explicit dates provided (default: 7 days) */
+  API_USAGE_DEFAULT_RANGE_DAYS: optionalPositiveIntEnv("API_USAGE_DEFAULT_RANGE_DAYS", 7),
