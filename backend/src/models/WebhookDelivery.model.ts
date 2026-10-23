@@ -1,65 +1,115 @@
-import mongoose, { Schema } from "mongoose";
-import { VerificationWebhookEvent } from "../types/verification.types";
-import type { WebhookDeliveryStatus, WebhookEvent, WebhookEventType } from "../types/webhook.types";
+/**
+ * Mongoose model for WebhookDelivery documents.
+ *
+ * Schema design decisions:
+ * - `payload` and `signature` are persisted verbatim so a failed delivery can
+ *   be replayed byte-for-byte, exactly as the endpoint first received it.
+ * - `webhookId` is indexed (not unique): a webhook endpoint accumulates many
+ *   deliveries over time.
+ * - `owner` is indexed: efficient authorization scoping per developer.
+ * - `status` is indexed: efficient filtering for failed deliveries pending
+ *   replay.
+ * - Timestamps are enabled via Mongoose options (adds `createdAt` / `updatedAt`);
+ *   `updatedAt` also backs the stale-replay reclaim window in the service layer.
+ */
+import { Schema, model, Document } from "mongoose";
+import { WebhookDeliveryStatus } from "../types/webhook.types";
+import type { IWebhookDelivery } from "../types/webhook.types";
 
-export interface IWebhookDelivery extends mongoose.Document {
-  registrationId: mongoose.Types.ObjectId;
-  ownerId: mongoose.Types.ObjectId;
-  eventId: string;
-  eventType: WebhookEventType;
-  payload: WebhookEvent;
-  payloadPreview: string;
-  status: WebhookDeliveryStatus;
-  attempts: number;
-  maxAttempts: number;
-  nextAttemptAt: Date;
-  lockExpiresAt?: Date;
-  responseCode?: number;
-  latencyMs?: number;
-  lastError?: string;
-  deliveredAt?: Date;
-  createdAt: Date;
-  updatedAt: Date;
-}
+export type WebhookDeliveryDocument = IWebhookDelivery & Document;
 
-const WebhookDeliverySchema = new Schema<IWebhookDelivery>(
+const ALL_STATUSES = Object.values(WebhookDeliveryStatus);
+
+const WebhookDeliverySchema = new Schema<WebhookDeliveryDocument>(
   {
-    registrationId: {
-      type: Schema.Types.ObjectId,
-      ref: "WebhookRegistration",
-      required: true,
+    webhookId: {
+      type: String,
+      required: [true, "webhookId is required"],
+      trim: true,
       index: true,
     },
-    ownerId: { type: Schema.Types.ObjectId, ref: "User", required: true, index: true },
-    eventId: { type: String, required: true },
-    eventType: {
-      type: String,
-      required: true,
-      enum: Object.values(VerificationWebhookEvent),
+    owner: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      index: true,
+      default: undefined,
     },
-    payload: { type: Schema.Types.Mixed, required: true },
-    payloadPreview: { type: String, required: true, maxlength: 512 },
+    event: {
+      type: String,
+      required: [true, "event is required"],
+      trim: true,
+    },
+    targetUrl: {
+      type: String,
+      required: [true, "targetUrl is required"],
+      trim: true,
+      validate: {
+        validator: (value: string): boolean => {
+          try {
+            const parsed = new URL(value);
+            return parsed.protocol === "http:" || parsed.protocol === "https:";
+          } catch {
+            return false;
+          }
+        },
+        message: "targetUrl must be a valid http(s) URL",
+      },
+    },
+    payload: {
+      type: String,
+      required: [true, "payload is required"],
+    },
+    signature: {
+      type: String,
+      required: [true, "signature is required"],
+      trim: true,
+    },
     status: {
       type: String,
-      required: true,
-      enum: ["pending", "processing", "delivered", "failed", "dead_letter"],
-      default: "pending",
+      required: [true, "status is required"],
+      enum: {
+        values: ALL_STATUSES,
+        message: `status must be one of: ${ALL_STATUSES.join(", ")}`,
+      },
+      default: WebhookDeliveryStatus.PENDING,
       index: true,
     },
-    attempts: { type: Number, required: true, default: 0, min: 0 },
-    maxAttempts: { type: Number, required: true, default: 5, min: 1 },
-    nextAttemptAt: { type: Date, required: true, default: Date.now, index: true },
-    lockExpiresAt: { type: Date },
-    responseCode: { type: Number, min: 100, max: 599 },
-    latencyMs: { type: Number, min: 0 },
-    lastError: { type: String, maxlength: 1000 },
-    deliveredAt: { type: Date },
+    attempts: {
+      type: Number,
+      required: true,
+      default: 0,
+      min: 0,
+    },
+    responseStatus: {
+      type: Number,
+      default: undefined,
+    },
+    lastError: {
+      type: String,
+      trim: true,
+      default: undefined,
+    },
+    lastAttemptAt: {
+      type: Date,
+      default: undefined,
+    },
+    deliveredAt: {
+      type: Date,
+      default: undefined,
+    },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    versionKey: false,
+  }
 );
 
-WebhookDeliverySchema.index({ registrationId: 1, eventId: 1 }, { unique: true });
-WebhookDeliverySchema.index({ status: 1, nextAttemptAt: 1, createdAt: 1 });
+// Composite index: look up a specific delivery within a developer's webhook
+// channel, optionally filtered by lifecycle state.
+WebhookDeliverySchema.index({ webhookId: 1, _id: 1 });
+WebhookDeliverySchema.index({ webhookId: 1, status: 1, updatedAt: -1 });
 
-export default (mongoose.models.WebhookDelivery as mongoose.Model<IWebhookDelivery> | undefined) ??
-  mongoose.model<IWebhookDelivery>("WebhookDelivery", WebhookDeliverySchema);
+export const WebhookDeliveryModel = model<WebhookDeliveryDocument>(
+  "WebhookDelivery",
+  WebhookDeliverySchema
+);

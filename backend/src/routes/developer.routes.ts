@@ -1,122 +1,25 @@
-import { Router, Request, Response, NextFunction } from 'express';
+/**
+ * Developer Routes.
+ *
+ * Endpoints:
+ *   POST /api/v1/developer/keys
+ *     Generates a new API key for the authenticated/submitted user.
+ *
+ *   POST /api/v1/developer/webhooks/:id/deliveries/:deliveryId/replay
+ *     Re-dispatches a failed webhook delivery using the payload and HMAC
+ *     signature stored at dispatch time. Only `failed` deliveries are
+ *     replayable (409 otherwise). Requires an x-api-key header; only the
+ *     delivery's owner (or an admin) may replay it.
+ *
+ * All Zod schemas are co-located with the routes that use them and are
+ * exported so the validation contract can be unit-tested directly.
+ */
+import { Router } from 'express';
+import type { Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { StatusCodes } from 'http-status-codes';
-import { generateApiKey, developerController } from '../controllers/developer.controller';
-import { protect } from '../middlewares/auth.middleware';
-
-const MONGO_OBJECT_ID_REGEX = /^[a-f\d]{24}$/i;
-const STATUS_VALUES = [
-  'pending',
-  'processing',
-  'tee_verifying',
-  'minting',
-  'completed',
-  'failed',
-];
-
-/**
- * Validation schema for list jobs query parameters
- */
-const listJobsQuerySchema = z.object({
-  page: z.coerce.number().int().min(1).optional().default(1),
-  limit: z.coerce.number().int().min(1).max(200).optional().default(20),
-  status: z.enum(STATUS_VALUES as [string, ...string[]]).optional(),
-  appId: z.string().optional(),
-  jobType: z.string().optional(),
-  createdFrom: z
-    .string()
-    .refine((value) => !Number.isNaN(Date.parse(value)), 'Invalid date format')
-    .optional(),
-  createdTo: z
-    .string()
-    .refine((value) => !Number.isNaN(Date.parse(value)), 'Invalid date format')
-    .optional(),
-  sortBy: z.enum(['createdAt', 'status', 'updatedAt']).optional().default('createdAt'),
-  sortOrder: z.enum(['asc', 'desc']).optional().default('desc'),
-});
-
-/**
- * Validation schema for usage summary query parameters
- */
-const usageSummaryQuerySchema = z.object({
-  from: z
-    .string()
-    .refine((value) => !Number.isNaN(Date.parse(value)), 'Invalid date format')
-    .optional(),
-  to: z
-    .string()
-    .refine((value) => !Number.isNaN(Date.parse(value)), 'Invalid date format')
-    .optional(),
-});
-
-/**
- * Validation schema for job ID parameter
- */
-const jobIdParamSchema = z.object({
-  id: z.string().regex(MONGO_OBJECT_ID_REGEX, 'Invalid job ID format'),
-});
-
-/**
- * Middleware to validate list jobs query parameters
- */
-function validateListJobsQuery(
-  req: Request,
-  res: Response,
-  next: NextFunction
-): void {
-  const result = listJobsQuerySchema.safeParse(req.query);
-  if (!result.success) {
-    res.status(StatusCodes.BAD_REQUEST).json({
-      success: false,
-      error: 'Invalid query parameters',
-      details: result.error.flatten().fieldErrors,
-    });
-    return;
-  }
-  Object.assign(req.query, result.data);
-  next();
-}
-
-/**
- * Middleware to validate usage summary query parameters
- */
-function validateUsageSummaryQuery(
-  req: Request,
-  res: Response,
-  next: NextFunction
-): void {
-  const result = usageSummaryQuerySchema.safeParse(req.query);
-  if (!result.success) {
-    res.status(StatusCodes.BAD_REQUEST).json({
-      success: false,
-      error: 'Invalid query parameters',
-      details: result.error.flatten().fieldErrors,
-    });
-    return;
-  }
-  Object.assign(req.query, result.data);
-  next();
-}
-
-/**
- * Middleware to validate job ID parameter
- */
-function validateJobIdParam(
-  req: Request,
-  res: Response,
-  next: NextFunction
-): void {
-  const result = jobIdParamSchema.safeParse({ id: req.params.id });
-  if (!result.success) {
-    res.status(StatusCodes.BAD_REQUEST).json({
-      success: false,
-      error: 'Invalid job ID format',
-      details: result.error.flatten().fieldErrors,
-    });
-    return;
-  }
-  next();
-}
+import { generateApiKey, replayWebhookDelivery } from '../controllers/developer.controller';
+import { verifyApiKey } from '../middlewares/apiKey.middleware';
 
 const router = Router();
 const webhookEvents = Object.values(VerificationWebhookEvent) as [
@@ -288,6 +191,62 @@ router.get(
   protect,
   validateUsageSummaryQuery,
   developerController.getUsageSummary.bind(developerController)
+);
+
+// ---------------------------------------------------------------------------
+// Zod schema – path parameters for the delivery replay endpoint.
+// ---------------------------------------------------------------------------
+export const replayDeliveryParamsSchema = z.object({
+  id: z
+    .string()
+    .trim()
+    .min(1, 'webhook id is required')
+    .max(128, 'webhook id must be at most 128 characters'),
+  deliveryId: z
+    .string()
+    .trim()
+    .regex(/^[a-f\d]{24}$/i, 'deliveryId must be a valid MongoDB ObjectId'),
+});
+
+// ---------------------------------------------------------------------------
+// Path parameter validation middleware
+// ---------------------------------------------------------------------------
+function validateReplayDeliveryParams(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  const result = replayDeliveryParamsSchema.safeParse(req.params);
+  if (!result.success) {
+    res.status(StatusCodes.BAD_REQUEST).json({
+      success: false,
+      error: 'Invalid path parameters',
+      details: result.error.flatten().fieldErrors,
+    });
+    return;
+  }
+  next();
+}
+
+/**
+ * POST /api/v1/developer/webhooks/:id/deliveries/:deliveryId/replay
+ *
+ * Response 200:
+ * {
+ *   "success": true,
+ *   "message": "Webhook delivery replayed successfully.",
+ *   "data": {
+ *     "delivery": { "id": "...", "status": "delivered", "attempts": 2, ... },
+ *     "delivered": true,
+ *     "responseStatus": 200
+ *   }
+ * }
+ */
+router.post(
+  '/webhooks/:id/deliveries/:deliveryId/replay',
+  verifyApiKey,
+  validateReplayDeliveryParams,
+  replayWebhookDelivery
 );
 
 export default router;
