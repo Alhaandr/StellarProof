@@ -1,9 +1,11 @@
 import crypto from 'crypto';
 import mongoose from 'mongoose';
+import { StatusCodes } from 'http-status-codes';
 import { Readable } from 'stream';
 import KMSKey, { IKMSKey } from '../models/KMSKey.model';
 import Asset, { IAsset } from '../models/Asset.model';
 import SPVRecordModel from '../models/SPVRecord.model';
+import { AppError } from '../errors/AppError';
 import { ipfsService } from './ipfs.service';
 import { kmsAuditService } from './kmsAudit.service';
 import { v2 as cloudinary, UploadApiResponse, UploadApiErrorResponse } from 'cloudinary';
@@ -21,6 +23,16 @@ const ALGORITHM = 'aes-256-gcm';
 const IV_LENGTH = 12; // 96-bit nonce is standard for GCM buffers
 const AUTH_TAG_LENGTH = 16; // 128-bit auth tag
 const DATA_KEY_LENGTH = 32; // AES-256 data key
+
+function unexpiredFilter(now: Date): Record<string, unknown> {
+  return {
+    $or: [
+      { expiresAt: { $exists: false } },
+      { expiresAt: null },
+      { expiresAt: { $gt: now } },
+    ],
+  };
+}
 
 export interface RotateKeyResult {
   oldKeyVersion: string;
@@ -73,6 +85,48 @@ function parseKeyVersion(keyVersion: string): number {
   const match = keyVersion.match(/^v(\d+)$/);
   if (!match) throw new Error(`Invalid key version format: ${keyVersion}`);
   return parseInt(match[1], 10);
+}
+
+/** A symmetric key wrapped (encrypted) by a master key, in the hex format stored on KMSKey. */
+interface WrappedKey {
+  encrypted: string;
+  iv: string;
+  authTag: string;
+}
+
+type WrappedKeyRecord = Pick<IKMSKey, 'encryptedKeyValue' | 'iv' | 'authTag'>;
+
+export interface MasterKeys {
+  current: Buffer;
+  previous?: Buffer;
+}
+
+export interface KeyRewrapSummary {
+  scanned: number;
+  rewrapped: number;
+  alreadyCurrent: number;
+  failed: string[];
+}
+
+/**
+ * Resolves the 256-bit master keys from validated configuration.
+ * Loaded lazily so importing this module never triggers environment validation.
+ * Keys are derived with SHA-256 as before, so symmetric keys wrapped under an
+ * existing MASTER_KEY remain decryptable.
+ */
+function resolveMasterKeys(): MasterKeys {
+  const { env } = require('../config/env') as typeof import('../config/env');
+  const derive = (secret: string): Buffer => crypto.createHash('sha256').update(secret).digest();
+
+  return {
+    current: derive(env.MASTER_KEY),
+    previous: env.MASTER_KEY_PREVIOUS ? derive(env.MASTER_KEY_PREVIOUS) : undefined,
+  };
+}
+
+/** Filter matching keys that have no expiry or whose expiry is still in the future. */
+function unexpiredFilter(now: Date) {
+  return { $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }] };
 }
 
 export class KmsService {
@@ -374,6 +428,100 @@ export class KmsService {
   }
 
   /**
+   * Deactivates keys whose expiry has passed. Returns the number of keys deactivated.
+   */
+  async deactivateExpiredKeys(now: Date = new Date()): Promise<number> {
+    const result = await KMSKey.updateMany(
+      { isActive: true, expiresAt: { $lte: now } },
+      { $set: { isActive: false } }
+    );
+    return result.modifiedCount;
+  }
+
+  /**
+   * Returns one page of active, unexpired keys created before `cutoff`, in _id
+   * order and starting after `afterId`. Pagination by _id keeps the scheduled
+   * sweep stable while the keys it rotates are being replaced.
+   */
+  async findKeysDueForRotation(params: {
+    cutoff: Date;
+    limit: number;
+    afterId?: mongoose.Types.ObjectId;
+    now?: Date;
+  }): Promise<IKMSKey[]> {
+    const { cutoff, limit, afterId, now = new Date() } = params;
+    const filter: Record<string, unknown> = {
+      isActive: true,
+      createdAt: { $lte: cutoff },
+      ...unexpiredFilter(now),
+    };
+    if (afterId) {
+      filter._id = { $gt: afterId };
+    }
+
+    return await KMSKey.find(filter).sort({ _id: 1 }).limit(limit);
+  }
+
+  /**
+   * Re-wraps every stored symmetric key under the current master key.
+   *
+   * Keys that already unwrap under the current master are skipped, so the
+   * sweep is idempotent and can be re-run after an interruption. Each key is
+   * saved on its own: a crash leaves unprocessed keys still readable through
+   * MASTER_KEY_PREVIOUS.
+   */
+  async rewrapKeysToCurrentMaster(batchSize = 100): Promise<KeyRewrapSummary> {
+    const { current, previous } = resolveMasterKeys();
+    if (!previous) {
+      throw new AppError(
+        'MASTER_KEY_PREVIOUS must be set to re-wrap KMS keys',
+        StatusCodes.INTERNAL_SERVER_ERROR,
+        'KMS_PREVIOUS_MASTER_KEY_MISSING'
+      );
+    }
+
+    const summary: KeyRewrapSummary = { scanned: 0, rewrapped: 0, alreadyCurrent: 0, failed: [] };
+    let afterId: mongoose.Types.ObjectId | undefined;
+    let batch: IKMSKey[];
+
+    do {
+      batch = await KMSKey.find(afterId ? { _id: { $gt: afterId } } : {})
+        .sort({ _id: 1 })
+        .limit(batchSize);
+
+      for (const key of batch) {
+        summary.scanned += 1;
+
+        if (this.tryUnwrapWithMaster(key, current) !== null) {
+          summary.alreadyCurrent += 1;
+          continue;
+        }
+
+        const symmetricKey = this.tryUnwrapWithMaster(key, previous);
+        if (!symmetricKey) {
+          summary.failed.push(key.id);
+          continue;
+        }
+
+        try {
+          const wrapped = this.wrapSymmetricKey(symmetricKey, current);
+          key.encryptedKeyValue = wrapped.encrypted;
+          key.iv = wrapped.iv;
+          key.authTag = wrapped.authTag;
+          await key.save();
+          summary.rewrapped += 1;
+        } catch {
+          summary.failed.push(key.id);
+        }
+      }
+
+      afterId = batch[batch.length - 1]?._id;
+    } while (batch.length === batchSize);
+
+    return summary;
+  }
+
+  /**
    * Re-keys every encrypted asset owned by `userId` under one new data key.
    *
    * Each asset keeps its own data key, referenced by its SPVRecord. For every
@@ -419,6 +567,19 @@ export class KmsService {
     }
 
     await this.destroyBlobs(blobs.replaced);
+    void webhookService.enqueueForOwner(
+      userId,
+      createWebhookEvent(VerificationWebhookEvent.KMS_KEY_ROTATED, {
+        keyVersion: result.newKeyVersion,
+        previousKeyVersion: result.oldKeyVersion,
+        assetsReEncrypted: result.assetsReEncrypted,
+      })
+    ).catch((error: unknown) => {
+      logger.error('Failed to enqueue KMS rotation webhook', {
+        userId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
     return result;
   }
 
@@ -586,7 +747,7 @@ export class KmsService {
 
   /** Reads KMS_MASTER_KEY (64 hex characters) used to wrap per-asset data keys. */
   private resolveWrappingKey(): Buffer {
-    const hex = process.env.KMS_MASTER_KEY;
+    const hex = process.env.KMS_MASTER_KEY ?? process.env.MASTER_KEY;
     if (!hex || !/^[0-9a-fA-F]{64}$/.test(hex)) {
       throw new Error('KMS_MASTER_KEY must be a 64-character hex string (32 bytes for AES-256)');
     }
@@ -629,6 +790,41 @@ export class KmsService {
     const decipher = crypto.createDecipheriv(ALGORITHM, this.resolveWrappingKey(), iv);
     decipher.setAuthTag(authTag);
     return Buffer.concat([decipher.update(wrapped), decipher.final()]);
+  }
+
+  /**
+   * Encrypts a symmetric key using the given master key (Hex output for DB storage)
+   */
+  private wrapSymmetricKey(symmetricKey: Buffer, masterKey: Buffer): WrappedKey {
+    const iv = crypto.randomBytes(16); // 16 bytes for hex storage format
+    const cipher = crypto.createCipheriv(ALGORITHM, masterKey, iv);
+
+    let encrypted = cipher.update(symmetricKey.toString('hex'), 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const authTag = cipher.getAuthTag();
+
+    return {
+      encrypted,
+      iv: iv.toString('hex'),
+      authTag: authTag.toString('hex')
+    };
+  }
+
+  /**
+   * Attempts to unwrap a stored symmetric key with one master key.
+   * Returns null when the GCM auth tag does not verify under that key.
+   */
+  private tryUnwrapWithMaster(record: WrappedKeyRecord, masterKey: Buffer): Buffer | null {
+    try {
+      const decipher = crypto.createDecipheriv(ALGORITHM, masterKey, Buffer.from(record.iv, 'hex'));
+      decipher.setAuthTag(Buffer.from(record.authTag, 'hex'));
+
+      let decryptedHex = decipher.update(record.encryptedKeyValue, 'hex', 'utf8');
+      decryptedHex += decipher.final('utf8');
+      return Buffer.from(decryptedHex, 'hex');
+    } catch {
+      return null;
+    }
   }
 
   private uploadRawToCloudinary(buffer: Buffer, publicId: string): Promise<UploadApiResponse> {
